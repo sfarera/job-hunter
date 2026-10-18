@@ -1,4 +1,5 @@
 import os
+import re
 import asyncio
 import yaml
 import urllib.parse
@@ -38,18 +39,25 @@ def save_applied_job(job_url, filepath="applied_jobs.txt"):
 
 def build_search_url(keywords, locations):
     base_url = "https://www.linkedin.com/jobs/search/?"
-    keyword_str = urllib.parse.quote(" ".join(keywords))
-    location_str = urllib.parse.quote(locations[0])
+    if isinstance(keywords, list):
+        # Format top keywords with Boolean OR for effective LinkedIn search matching
+        top_kws = keywords[:3] if len(keywords) > 3 else keywords
+        query = " OR ".join(f'"{kw}"' if " " in kw else kw for kw in top_kws)
+    else:
+        query = str(keywords)
+
+    keyword_str = urllib.parse.quote(query)
+    location_str = urllib.parse.quote(locations[0]) if locations else "Remote"
     
     # f_AL=true  = Easy Apply only
-    # f_I=96,4,556 = IT Services & Consulting, Software Development, Technology & Information
-    # f_CF=f_AL  = Combined filter: Easy Apply within the IT category
+    # f_I=96,4,556,6 = IT Services & Consulting, Software Development, Technology & Information, Computer Hardware
+    # f_WT=2,3,4 = Remote (2), Hybrid (3), On-site (4) — keeps all
     params = (
         f"keywords={keyword_str}"
         f"&location={location_str}"
         f"&f_AL=true"
-        f"&f_I=96%2C4%2C556%2C6"   # IT Services, Software Dev, Tech & Info, Computer Hardware
-        f"&f_WT=2%2C3%2C4"          # Work type: Remote (2), Hybrid (3), On-site (4) — keeps all
+        f"&f_I=96%2C4%2C556%2C6"
+        f"&f_WT=2%2C3%2C4"
     )
     return base_url + params
 
@@ -66,6 +74,30 @@ def is_job_relevant(job_title: str, profile: dict) -> bool:
         title_lower = title_lower.replace(noise, "")
     
     return any(kw.lower() in title_lower for kw in keywords)
+
+def is_location_allowed(text: str, profile: dict) -> tuple[bool, str]:
+    """
+    Checks if text (from a job card, header, or job details) contains any excluded location.
+    Returns (allowed: bool, reason: str).
+    """
+    if not text:
+        return True, ""
+    
+    excluded = profile.get("job_preferences", {}).get("excluded_locations", [])
+    # Always include common variants for explicitly blacklisted locations
+    if not excluded:
+        excluded = ["Israel", "Tel Aviv"]
+        
+    text_lower = text.lower()
+    for loc in excluded:
+        loc_clean = loc.strip().lower()
+        if not loc_clean:
+            continue
+        pattern = r"\b" + re.escape(loc_clean) + r"\b"
+        if re.search(pattern, text_lower):
+            return False, f"Matched excluded location '{loc}'"
+            
+    return True, ""
 
 async def process_job(page: Page, job_url: str, profile: dict):
     print(f"\nProcessing job: {job_url}")
@@ -85,6 +117,33 @@ async def process_job(page: Page, job_url: str, profile: dict):
     
     if job_title:
         print(f"  Job title: '{job_title}' — relevant, proceeding.")
+
+    # --- Location check: reject jobs in excluded locations ---
+    try:
+        page_location_snippet = await page.evaluate("""() => {
+            const selectors = [
+                '.job-details-jobs-unified-top-card',
+                '.jobs-unified-top-card',
+                '[class*="topcard"]',
+                '[class*="top-card"]',
+                '.job-details-jobs-unified-top-card__primary-description-container',
+                'div[data-view-name="job-details"]'
+            ];
+            for (const s of selectors) {
+                const el = document.querySelector(s);
+                if (el && el.innerText.trim().length > 10) {
+                    return el.innerText;
+                }
+            }
+            return document.title + ' ' + (document.body ? document.body.innerText.slice(0, 3000) : '');
+        }""")
+    except Exception:
+        page_location_snippet = ""
+        
+    allowed, reason = is_location_allowed(page_location_snippet, profile)
+    if not allowed:
+        print(f"  Skipping job: {reason} ({job_url})")
+        return False
     
     # Check for Easy Apply button
     try:
@@ -212,10 +271,17 @@ async def main():
         
         print("Navigating to search results...")
         await page.goto(search_url, wait_until="domcontentloaded")
-        await page.wait_for_load_state("domcontentloaded")
-
-        if not await has_valid_linkedin_session(page):
-            print("ERROR: LinkedIn session is not valid. Run `python auth.py` and log in again.")
+        await asyncio.sleep(2)
+        current_url = page.url
+        if not await has_valid_linkedin_session(page) or any(auth_kw in current_url for auth_kw in ["/login", "/uas/login", "checkpoint", "authwall"]):
+            print("\n" + "=" * 60)
+            print("[ERROR] LinkedIn session is expired or not authenticated!")
+            print(f"Current page URL: {current_url}")
+            print("LinkedIn requires an active session to search and Easy Apply.")
+            print("Please run:")
+            print("    python auth.py")
+            print("to log in and save your session, then re-run 'python main.py'.")
+            print("=" * 60 + "\n")
             await browser.close()
             return
         
@@ -223,28 +289,52 @@ async def main():
         job_links = []
         max_apps = int(os.getenv("MAX_APPLICATIONS", "15"))
         try:
-            # Wait for the job list to appear
-            await page.wait_for_selector(".jobs-search-results__list, .scaffold-layout__list", timeout=15000)
+            # Wait for the job list to appear with multiple fallback selectors
+            job_list_selector = ".jobs-search-results__list, .jobs-search-results-list, .scaffold-layout__list, .scaffold-layout__list-container"
+            try:
+                await page.wait_for_selector(job_list_selector, timeout=15000)
+            except Exception:
+                # If container selector times out, check if any job links are already loaded
+                if await page.locator("a[href*='/jobs/view/']").count() == 0:
+                    raise
             
             # Scroll the job list panel to lazy-load more cards
             target_links = max(max_apps * 5, max_apps)
             print(f"Scrolling job list to collect up to {target_links} candidate job links...")
             for scroll_pass in range(10): # scroll up to 10 times
-                # Collect current links
-                links = await page.locator("a[href*='/jobs/view/']").all()
-                for link in links:
-                    href = await link.get_attribute("href")
-                    if href:
-                        clean_url = "https://www.linkedin.com" + href.split("?")[0] if href.startswith("/") else href.split("?")[0]
-                        if clean_url not in job_links:
-                            job_links.append(clean_url)
+                # Collect current links from cards, filtering out excluded locations immediately
+                card_elements = await page.locator("li[data-occludable-job-id], .jobs-search-results__list-item, div.job-card-container").all()
+                if card_elements:
+                    for card in card_elements:
+                        try:
+                            card_text = await card.inner_text()
+                            allowed, reason = is_location_allowed(card_text, profile)
+                            if not allowed:
+                                continue
+                            link_el = card.locator("a[href*='/jobs/view/']").first
+                            if await link_el.count() > 0:
+                                href = await link_el.get_attribute("href")
+                                if href:
+                                    clean_url = "https://www.linkedin.com" + href.split("?")[0] if href.startswith("/") else href.split("?")[0]
+                                    if clean_url not in job_links:
+                                        job_links.append(clean_url)
+                        except Exception:
+                            continue
+                else:
+                    links = await page.locator("a[href*='/jobs/view/']").all()
+                    for link in links:
+                        href = await link.get_attribute("href")
+                        if href:
+                            clean_url = "https://www.linkedin.com" + href.split("?")[0] if href.startswith("/") else href.split("?")[0]
+                            if clean_url not in job_links:
+                                job_links.append(clean_url)
                 
                 if len(job_links) >= target_links:
                     break # We have enough, stop scrolling
                 
                 # Scroll the job list panel down to load more cards
                 await page.evaluate("""
-                    const list = document.querySelector('.jobs-search-results__list, .scaffold-layout__list');
+                    const list = document.querySelector('.jobs-search-results__list, .jobs-search-results-list, .scaffold-layout__list, .scaffold-layout__list-container');
                     if (list) list.scrollBy(0, 600);
                 """)
                 await asyncio.sleep(1.5) # wait for new cards to load

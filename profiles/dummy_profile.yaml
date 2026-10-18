@@ -35,6 +35,8 @@ job_preferences:
   locations:
     - "Remote"
     - "Bangalore"
+  excluded_locations:
+    - "Israel"
   remote_only: false
   easy_apply_only: true
 
