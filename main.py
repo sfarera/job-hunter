@@ -4,8 +4,13 @@ import yaml
 import urllib.parse
 from datetime import datetime
 from playwright.async_api import async_playwright, Page
-from browser import get_browser, get_context
-from agent import execute_smart_form_fill
+from dotenv import load_dotenv
+from browser import get_browser, get_context, save_state
+from agent import execute_smart_form_fill, get_easy_apply_modal
+
+load_dotenv()
+
+JOB_TIMEOUT_SECONDS = int(os.getenv("JOB_TIMEOUT_SECONDS", "240"))
 
 def load_profile():
     profile_name = os.getenv("PROFILE", "shubham_profile")
@@ -64,13 +69,12 @@ def is_job_relevant(job_title: str, profile: dict) -> bool:
 
 async def process_job(page: Page, job_url: str, profile: dict):
     print(f"\nProcessing job: {job_url}")
-    await page.goto(job_url)
-    await page.wait_for_load_state("domcontentloaded")
-    await asyncio.sleep(2) # Give dynamic scripts a moment to attach
+    await page.goto(job_url, wait_until="domcontentloaded")
+    await asyncio.sleep(2)  # Give dynamic scripts / hydration a moment to attach
     
     # --- Relevance check: skip irrelevant jobs before doing anything ---
     try:
-        job_title_el = page.locator("h1.t-24, h1.jobs-unified-top-card__job-title, .job-details-jobs-unified-top-card__job-title h1").first
+        job_title_el = page.locator("h1.t-24, h1.jobs-unified-top-card__job-title, .job-details-jobs-unified-top-card__job-title h1, h1[class*='job-title']").first
         job_title = (await job_title_el.inner_text()).strip() if await job_title_el.count() > 0 else ""
     except Exception:
         job_title = ""
@@ -84,13 +88,44 @@ async def process_job(page: Page, job_url: str, profile: dict):
     
     # Check for Easy Apply button
     try:
-        easy_apply_element = page.locator("text='Easy Apply'").first
-        await easy_apply_element.wait_for(state="visible", timeout=5000)
+        easy_apply_locator = page.locator(
+            "button.jobs-apply-button, "
+            "button:has-text('Easy Apply'), "
+            "[aria-label*='Easy Apply' i]"
+        ).first
         
-        if await easy_apply_element.is_visible():
+        try:
+            await easy_apply_locator.wait_for(state="visible", timeout=6000)
+        except Exception:
+            pass
+        
+        if await easy_apply_locator.is_visible():
             print("Found Easy Apply button. Clicking...")
-            await easy_apply_element.click()
+            clicked = False
+            for attempt in range(3):
+                try:
+                    await easy_apply_locator.click(timeout=5000)
+                    clicked = True
+                    break
+                except Exception as click_err:
+                    err_msg = str(click_err).lower()
+                    if ("detached" in err_msg or "timeout" in err_msg) and attempt < 2:
+                        print(f"  Easy Apply click retry {attempt + 1}/3 due to DOM change...")
+                        await asyncio.sleep(1)
+                        continue
+                    raise click_err
+
+            if not clicked:
+                print("Could not click Easy Apply button.")
+                return False
             
+            modal = await get_easy_apply_modal(page, timeout=15000)
+            if not await modal.is_visible():
+                print("Easy Apply modal did not appear.")
+                return False
+            
+            await asyncio.sleep(1.5)  # Wait for modal animation and footer buttons to mount
+
             # AI Agent takes over here
             print("Form opened. Handing over to Smart AI Agent.")
             success = await execute_smart_form_fill(page, profile)
@@ -101,6 +136,60 @@ async def process_job(page: Page, job_url: str, profile: dict):
     except Exception as e:
         print(f"Error or timeout finding Easy Apply button: {e}")
         return False
+
+async def has_valid_linkedin_session(page: Page) -> bool:
+    """Detect expired auth before starting the job loop."""
+    url = page.url.lower()
+    if "/login" in url or "checkpoint" in url:
+        return False
+
+    login_indicators = page.locator("input[name='session_key'], input[name='session_password'], text=/sign in/i")
+    try:
+        return not await login_indicators.first.is_visible(timeout=2500)
+    except Exception:
+        return True
+
+async def dismiss_easy_apply_modal(page: Page):
+    """Best-effort cleanup so one failed application does not block the next job."""
+    try:
+        discard_selectors = (
+            "button:has-text('Discard'), "
+            "[data-testid='dialog'] button:has-text('Discard'), "
+            "button[data-control-name*='discard'], "
+            "button[data-test-dialog-secondary-action]"
+        )
+
+        # 1. If 'Save this application?' popup is already open, click Discard immediately
+        discard_btn = page.locator(discard_selectors).first
+        if await discard_btn.count() > 0 and await discard_btn.is_visible():
+            await discard_btn.click(timeout=3000)
+            await asyncio.sleep(1)
+            return
+
+        # 2. Otherwise click Dismiss (X)
+        dismiss_btn = page.locator(
+            "dialog[open] button[aria-label='Dismiss'], "
+            "dialog[open] button:has-text('Dismiss'), "
+            "[data-testid='dialog'] button[aria-label='Dismiss'], "
+            "[data-testid='dialog'] button:has-text('Dismiss'), "
+            "[role='dialog'] button[aria-label='Dismiss'], "
+            ".artdeco-modal button[aria-label='Dismiss'], "
+            "button[aria-label='Dismiss']"
+        ).first
+        if await dismiss_btn.count() > 0 and await dismiss_btn.is_visible():
+            await dismiss_btn.click(timeout=3000)
+            await asyncio.sleep(1)
+
+        # 3. Handle the 'Save this application?' confirmation popup
+        discard_btn = page.locator(discard_selectors).first
+        try:
+            await discard_btn.wait_for(state="visible", timeout=3000)
+            await discard_btn.click(timeout=3000)
+            await asyncio.sleep(0.5)
+        except Exception:
+            pass
+    except Exception:
+        pass
 
 async def main():
     print("Starting Job Hunter...")
@@ -122,8 +211,13 @@ async def main():
         page = await context.new_page()
         
         print("Navigating to search results...")
-        await page.goto(search_url)
+        await page.goto(search_url, wait_until="domcontentloaded")
         await page.wait_for_load_state("domcontentloaded")
+
+        if not await has_valid_linkedin_session(page):
+            print("ERROR: LinkedIn session is not valid. Run `python auth.py` and log in again.")
+            await browser.close()
+            return
         
         # Scrape job cards (robust method)
         job_links = []
@@ -133,7 +227,8 @@ async def main():
             await page.wait_for_selector(".jobs-search-results__list, .scaffold-layout__list", timeout=15000)
             
             # Scroll the job list panel to lazy-load more cards
-            print(f"Scrolling job list to collect up to {max_apps} job links...")
+            target_links = max(max_apps * 5, max_apps)
+            print(f"Scrolling job list to collect up to {target_links} candidate job links...")
             for scroll_pass in range(10): # scroll up to 10 times
                 # Collect current links
                 links = await page.locator("a[href*='/jobs/view/']").all()
@@ -144,7 +239,7 @@ async def main():
                         if clean_url not in job_links:
                             job_links.append(clean_url)
                 
-                if len(job_links) >= max_apps:
+                if len(job_links) >= target_links:
                     break # We have enough, stop scrolling
                 
                 # Scroll the job list panel down to load more cards
@@ -180,7 +275,20 @@ async def main():
                 print(f"Skipping already applied job: {clean_link}")
                 continue
                 
-            success = await process_job(page, link, profile)
+            success = False
+            try:
+                success = await asyncio.wait_for(
+                    process_job(page, link, profile),
+                    timeout=JOB_TIMEOUT_SECONDS,
+                )
+                if not success:
+                    await dismiss_easy_apply_modal(page)
+            except asyncio.TimeoutError:
+                print(f"Timed out processing job after {JOB_TIMEOUT_SECONDS}s: {link}")
+                await dismiss_easy_apply_modal(page)
+            except Exception as e:
+                print(f"Error processing job {link}: {e}")
+                await dismiss_easy_apply_modal(page)
             if success:
                 success_count += 1
                 successful_jobs.append(link)
@@ -197,6 +305,7 @@ async def main():
             print(f" - {job}")
         print("=================================\n")
             
+        await save_state(context)
         await browser.close()
 
 if __name__ == "__main__":
