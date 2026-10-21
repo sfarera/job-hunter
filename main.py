@@ -157,7 +157,7 @@ def is_location_allowed(text: str, profile: dict) -> tuple[bool, str]:
 async def process_job(page: Page, job_url: str, profile: dict):
     print(f"\nProcessing job: {job_url}")
     await page.goto(job_url, wait_until="domcontentloaded")
-    await asyncio.sleep(2)  # Give dynamic scripts / hydration a moment to attach
+    await asyncio.sleep(0.8)  # Brief delay for dynamic scripts / hydration
     
     # --- Relevance check: skip irrelevant jobs before doing anything ---
     try:
@@ -272,7 +272,7 @@ async def process_job(page: Page, job_url: str, profile: dict):
                 print("Easy Apply modal did not appear.")
                 return False
             
-            await asyncio.sleep(1.5)  # Wait for modal animation and footer buttons to mount
+            await asyncio.sleep(0.5)  # Brief pause for modal animation and buttons to mount
 
             # AI Agent takes over here
             print("Form opened. Handing over to Smart AI Agent.")
@@ -389,51 +389,48 @@ async def main():
             
             # Scroll the job list panel to lazy-load more cards
             target_links = max(max_apps * 5, max_apps)
-            print(f"Scrolling job list to collect up to {target_links} candidate job links...")
-            for scroll_pass in range(10): # scroll up to 10 times
-                # Collect current links from cards, filtering out excluded locations immediately
-                card_elements = await page.locator("li[data-occludable-job-id], .jobs-search-results__list-item, div.job-card-container").all()
-                if card_elements:
-                    for card in card_elements:
-                        try:
-                            card_text = await card.inner_text()
-                            allowed, reason = is_location_allowed(card_text, profile)
-                            if not allowed:
-                                continue
-                            
-                            # Filter contract cards
-                            if profile.get("job_preferences", {}).get("exclude_contract", True):
-                                is_c, c_reason = is_contract_job(card_text)
-                                if is_c:
-                                    continue
+            print(f"Collecting up to {target_links} candidate job links...")
+            for scroll_pass in range(6): # Fast scroll passes
+                # High-speed DOM evaluation in a single browser call (takes ~5ms)
+                cards_data = await page.evaluate("""() => {
+                    const cards = Array.from(document.querySelectorAll(
+                        'li[data-occludable-job-id], .jobs-search-results__list-item, div.job-card-container, div[data-view-name="job-card"]'
+                    ));
+                    return cards.map(c => {
+                        const link = c.querySelector('a[href*="/jobs/view/"]');
+                        return {
+                            text: c.innerText || '',
+                            href: link ? link.getAttribute('href') : ''
+                        };
+                    }).filter(item => item.href);
+                }""")
 
-                            link_el = card.locator("a[href*='/jobs/view/']").first
-                            if await link_el.count() > 0:
-                                href = await link_el.get_attribute("href")
-                                if href:
-                                    clean_url = "https://www.linkedin.com" + href.split("?")[0] if href.startswith("/") else href.split("?")[0]
-                                    if clean_url not in job_links:
-                                        job_links.append(clean_url)
-                        except Exception:
+                for item in cards_data:
+                    card_text = item.get("text", "")
+                    href = item.get("href", "")
+
+                    allowed, _ = is_location_allowed(card_text, profile)
+                    if not allowed:
+                        continue
+
+                    if profile.get("job_preferences", {}).get("exclude_contract", True):
+                        is_c, _ = is_contract_job(card_text)
+                        if is_c:
                             continue
-                else:
-                    links = await page.locator("a[href*='/jobs/view/']").all()
-                    for link in links:
-                        href = await link.get_attribute("href")
-                        if href:
-                            clean_url = "https://www.linkedin.com" + href.split("?")[0] if href.startswith("/") else href.split("?")[0]
-                            if clean_url not in job_links:
-                                job_links.append(clean_url)
-                
+
+                    clean_url = "https://www.linkedin.com" + href.split("?")[0] if href.startswith("/") else href.split("?")[0]
+                    if clean_url not in job_links:
+                        job_links.append(clean_url)
+
                 if len(job_links) >= target_links:
-                    break # We have enough, stop scrolling
-                
+                    break
+
                 # Scroll the job list panel down to load more cards
                 await page.evaluate("""
                     const list = document.querySelector('.jobs-search-results__list, .jobs-search-results-list, .scaffold-layout__list, .scaffold-layout__list-container');
-                    if (list) list.scrollBy(0, 600);
+                    if (list) list.scrollBy(0, 800);
                 """)
-                await asyncio.sleep(1.5) # wait for new cards to load
+                await asyncio.sleep(0.4) # Fast scroll wait
             
             print(f"Found {len(job_links)} unique job links after scrolling.")
             # We no longer hardcode a limit here, we check max_applications below

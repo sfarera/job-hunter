@@ -2,7 +2,7 @@ import asyncio
 import json
 import os
 import re
-from typing import Any
+from typing import Any, Optional
 
 from dotenv import load_dotenv
 from playwright.async_api import Locator, Page
@@ -57,34 +57,12 @@ Rules:
 """
 
 
-async def get_easy_apply_modal(page: Page, timeout: int = 15000) -> Locator:
+async def get_easy_apply_modal(page: Page, timeout: int = 5000) -> Locator:
     locator = page.locator(MODAL_SELECTOR)
     try:
         await locator.first.wait_for(state="visible", timeout=timeout)
     except Exception:
         pass
-
-    count = await locator.count()
-    for i in range(count):
-        candidate = locator.nth(i)
-        if not await candidate.is_visible():
-            continue
-        test_id = (await candidate.get_attribute("data-testid") or "").lower()
-        if "popover" in test_id:
-            continue
-        has_form_controls = await candidate.locator("input, select, textarea").count() > 0
-        has_apply_buttons = await candidate.locator(
-            "button:has-text('Submit'), button:has-text('Next'), button:has-text('Review'), "
-            "button:has-text('Upload'), button:has-text('Dismiss'), button[aria-label='Dismiss']"
-        ).count() > 0
-        if has_form_controls or has_apply_buttons:
-            return candidate
-
-    for i in range(count):
-        candidate = locator.nth(i)
-        if await candidate.is_visible():
-            return candidate
-
     return locator.first
 
 
@@ -339,12 +317,146 @@ def primary_progression_action(context: dict[str, Any]) -> list[dict[str, Any]]:
     return []
 
 
-async def decide_next_actions(context: dict[str, Any], profile: dict[str, Any]) -> list[dict[str, Any]]:
-    if not has_fields_needing_input(context):
-        fallback = primary_progression_action(context)
-        if fallback:
-            return fallback
+def try_fast_path_actions(context: dict[str, Any], profile: dict[str, Any]) -> Optional[list[dict[str, Any]]]:
+    """
+    Attempts to solve form actions deterministically without an LLM round-trip.
+    Returns a list of actions if confident, or None to fall back to LLM.
+    """
+    if context.get("errors"):
+        return None
 
+    fields = context.get("fields", [])
+    standard_answers = profile.get("standard_answers", {})
+    skill_exp = profile.get("skill_experience_years", {})
+    personal_info = profile.get("personal_info", {})
+
+    # Check if all required inputs and radio groups are already satisfied
+    empty_required = [
+        f for f in fields
+        if (f.get("required") or f.get("tag") in {"select"})
+        and not f.get("value")
+        and f.get("type") not in {"hidden", "submit", "button"}
+    ]
+
+    radio_groups: dict[str, list[dict[str, Any]]] = {}
+    for f in fields:
+        if f.get("type") == "radio":
+            group_key = f.get("name") or f.get("label", "").split(" - ")[0]
+            radio_groups.setdefault(group_key, []).append(f)
+
+    unanswered_radios = [
+        group for group in radio_groups.values()
+        if not any(f.get("checked") for f in group)
+    ]
+
+    # If nothing needs answering (e.g. final Review step or pre-filled Contact step)
+    if not empty_required and not unanswered_radios:
+        progression = primary_progression_action(context)
+        if progression:
+            return progression
+
+    # Try to match and fill all empty / unanswered fields
+    actions = []
+    for f in fields:
+        f_type = str(f.get("type", "")).lower()
+        f_tag = str(f.get("tag", "")).lower()
+        curr_val = str(f.get("value", "")).strip()
+        field_id = f.get("id") or f.get("selector")
+        label = (f.get("label") or "").lower()
+
+        if curr_val and f_type != "radio":
+            continue
+
+        if f_type == "file":
+            resume_path = profile.get("resume_path") or "Shubham_Farera_Resume.pdf"
+            actions.append({"action": "upload", "id": field_id, "path": resume_path})
+            continue
+
+        # Experience questions (e.g. "How many years of work experience do you have with Java?")
+        if any(term in label for term in ["years", "experience"]):
+            matched_years = None
+            for skill, yrs in skill_exp.items():
+                if skill.lower() in label:
+                    matched_years = str(yrs)
+                    break
+            if not matched_years:
+                matched_years = str(profile.get("professional_info", {}).get("years_of_experience", 8))
+            actions.append({"action": "fill", "id": field_id, "value": matched_years})
+            continue
+
+        # Location / City
+        if any(term in label for term in ["city", "location", "address"]):
+            loc = personal_info.get("location", "Pune, India")
+            actions.append({"action": "fill", "id": field_id, "value": loc})
+            continue
+
+        # Notice period
+        if "notice" in label or "period" in label:
+            np = str(standard_answers.get("notice_period", "3 months"))
+            if f_tag == "select" and f.get("options"):
+                opt = next((o for o in f["options"] if "3" in o or "month" in o.lower()), f["options"][0])
+                actions.append({"action": "select", "id": field_id, "value": opt})
+            else:
+                actions.append({"action": "fill", "id": field_id, "value": np})
+            continue
+
+        # Salary
+        if "current" in label and any(term in label for term in ["salary", "ctc", "compensation"]):
+            sal = re.sub(r"[^\d]", "", str(standard_answers.get("current_salary", "1850000")))
+            actions.append({"action": "fill", "id": field_id, "value": sal})
+            continue
+
+        if "expected" in label and any(term in label for term in ["salary", "ctc", "compensation"]):
+            sal = re.sub(r"[^\d]", "", str(standard_answers.get("expected_salary", "3000000")))
+            actions.append({"action": "fill", "id": field_id, "value": sal})
+            continue
+
+        # If a required field cannot be deterministically matched, fallback to LLM
+        if f.get("required"):
+            return None
+
+    # Resolve unanswered radios
+    for group in unanswered_radios:
+        group_label = (group[0].get("label") or "").lower()
+        target_choice = None
+        if "sponsorship" in group_label or "visa" in group_label:
+            target_choice = "No" if not standard_answers.get("require_sponsorship", False) else "Yes"
+        elif "authorized" in group_label or "legally" in group_label:
+            target_choice = "Yes" if standard_answers.get("legally_authorized", True) else "No"
+        elif "relocate" in group_label:
+            target_choice = "Yes" if standard_answers.get("willing_to_relocate", True) else "No"
+        elif "commute" in group_label:
+            target_choice = "Yes" if standard_answers.get("willing_to_commute", True) else "No"
+        elif "background" in group_label:
+            target_choice = "Yes"
+        elif "18" in group_label or "age" in group_label:
+            target_choice = "Yes"
+
+        if target_choice:
+            matching_radio = next((r for r in group if target_choice.lower() in (r.get("label") or "").lower()), None)
+            if matching_radio:
+                actions.append({"action": "check", "id": matching_radio.get("id") or matching_radio.get("selector")})
+            else:
+                return None
+        else:
+            return None
+
+    progression = primary_progression_action(context)
+    if not progression:
+        return None
+    actions.extend(progression)
+    return actions
+
+
+async def decide_next_actions(context: dict[str, Any], profile: dict[str, Any]) -> list[dict[str, Any]]:
+    # 1. Fast Path: instant resolution without LLM latency (0ms network delay)
+    fast_actions = try_fast_path_actions(context, profile)
+    if fast_actions:
+        print(f"  [Fast-Path] Auto-resolved {len(fast_actions)} action(s) deterministically (0ms LLM latency).")
+        return fast_actions
+
+    # 2. AI Fallback: handles custom essay questions, unfamiliar dropdowns, or fixing errors
+    print("  [AI Fallback] Custom question or validation error detected, consulting LLM...")
     prompt = f"""{SYSTEM_PROMPT}
 
 PROFILE:
@@ -440,7 +552,7 @@ async def execute_actions(page: Page, actions: list[dict[str, Any]], profile: di
             await click_modal_button(modal, button_text)
             clicked_progress = True
             clicked_submit = "submit" in button_text.lower()
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.3)
             continue
 
         try:
@@ -554,8 +666,8 @@ async def execute_smart_form_fill(page: Page, profile: dict[str, Any]) -> bool:
     for step in range(max_steps):
         print(f"\nStep {step + 1}: Reading Easy Apply modal DOM...")
 
-        # Give modal content and buttons a moment to render/settle
-        await asyncio.sleep(1.2)
+        # Give modal content and buttons a brief moment to render
+        await asyncio.sleep(0.4)
 
         if await is_submission_success(page):
             done_btn = page.locator("button:has-text('Done'), [data-testid='dialog'] button:has-text('Done')").first
@@ -595,7 +707,7 @@ async def execute_smart_form_fill(page: Page, profile: dict[str, Any]) -> bool:
             print("  AI returned no valid actions.")
             return False
 
-        print(f"  AI returned {len(actions)} action(s): {actions}")
+        print(f"  Actions to execute: {actions}")
         if any(action.get("action") == "done" for action in actions):
             if await is_submission_success(page):
                 done_btn = page.locator("button:has-text('Done'), [data-testid='dialog'] button:has-text('Done')").first
@@ -606,7 +718,6 @@ async def execute_smart_form_fill(page: Page, profile: dict[str, Any]) -> bool:
                         pass
                 print("  Application submitted successfully.")
                 return True
-            # AI prematurely returned done while form is not yet submitted.
             progression = primary_progression_action(context)
             if progression:
                 actions = progression
@@ -620,7 +731,7 @@ async def execute_smart_form_fill(page: Page, profile: dict[str, Any]) -> bool:
             return False
 
         if result == "submitted":
-            await asyncio.sleep(2)
+            await asyncio.sleep(1.0)
             if await is_submission_success(page):
                 done_btn = page.locator("button:has-text('Done'), [data-testid='dialog'] button:has-text('Done')").first
                 if await done_btn.count() > 0 and await done_btn.is_visible():
@@ -632,7 +743,7 @@ async def execute_smart_form_fill(page: Page, profile: dict[str, Any]) -> bool:
                 return True
             print("  Submit was clicked but no confirmation was detected yet.")
 
-        await asyncio.sleep(1)
+        await asyncio.sleep(0.3)
 
     print("--- Form filling reached max steps ---\n")
     return False
