@@ -37,6 +37,8 @@ job_preferences:
     - "Bangalore"
   excluded_locations:
     - "Israel"
+  exclude_contract: true
+  full_time_only: true
   remote_only: false
   easy_apply_only: true
 

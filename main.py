@@ -37,7 +37,7 @@ def save_applied_job(job_url, filepath="applied_jobs.txt"):
     with open(filepath, "a") as f:
         f.write(f"{job_url} | {timestamp}\n")
 
-def build_search_url(keywords, locations):
+def build_search_url(keywords, locations, profile=None):
     base_url = "https://www.linkedin.com/jobs/search/?"
     if isinstance(keywords, list):
         # Format top keywords with Boolean OR for effective LinkedIn search matching
@@ -52,26 +52,81 @@ def build_search_url(keywords, locations):
     # f_AL=true  = Easy Apply only
     # f_I=96,4,556,6 = IT Services & Consulting, Software Development, Technology & Information, Computer Hardware
     # f_WT=2,3,4 = Remote (2), Hybrid (3), On-site (4) — keeps all
+    # f_JT=F = Full-time only (filters out Contract, Part-time, Temporary)
+    exclude_contract = True
+    if profile:
+        exclude_contract = profile.get("job_preferences", {}).get("exclude_contract", True)
+    job_type_param = "&f_JT=F" if exclude_contract else ""
+
     params = (
         f"keywords={keyword_str}"
         f"&location={location_str}"
         f"&f_AL=true"
         f"&f_I=96%2C4%2C556%2C6"
         f"&f_WT=2%2C3%2C4"
+        f"{job_type_param}"
     )
     return base_url + params
+
+CONTRACT_KEYWORDS = [
+    "contract",
+    "contractor",
+    "c2c",
+    "c2h",
+    "corp to corp",
+    "corp-to-corp",
+    "contract-to-hire",
+    "contract to hire",
+    "fixed term",
+    "fixed-term",
+    "temporary",
+    "temp",
+    "freelance",
+    "part-time",
+    "part time",
+    "hourly",
+    "internship",
+    "intern",
+]
+
+def is_contract_job(text: str) -> tuple[bool, str]:
+    """
+    Checks if a job title, description, badge, or card snippet indicates a contract,
+    freelance, temporary, or non-permanent position.
+    Returns (is_contract: bool, reason: str).
+    """
+    if not text:
+        return False, ""
+    
+    text_lower = text.lower()
+    
+    # Check for duration patterns like "6-month contract", "12 months contract", "6 month", etc.
+    month_match = re.search(
+        r"\b\d+\s*[-_ ]*(?:month|year|week|day|mo|yr)s?\s*(?:contract|c2c|c2h|temp|fixed[\s-]*term)\b",
+        text_lower
+    )
+    if month_match:
+        return True, f"Found duration contract '{month_contract_match.group(0) if 'month_contract_match' in locals() else month_match.group(0)}'"
+        
+    for kw in CONTRACT_KEYWORDS:
+        pattern = r"\b" + re.escape(kw) + r"\b"
+        if re.search(pattern, text_lower):
+            return True, f"Matched contract term '{kw}'"
+            
+    return False, ""
 
 def is_job_relevant(job_title: str, profile: dict) -> bool:
     """
     Checks if a job title contains at least one keyword from the profile.
-    Case-insensitive. Returns True even for contract/freelance roles.
+    Case-insensitive. Rejects contract roles if exclude_contract is True.
     """
+    if profile.get("job_preferences", {}).get("exclude_contract", True):
+        is_c, _ = is_contract_job(job_title)
+        if is_c:
+            return False
+
     keywords = profile.get("job_preferences", {}).get("keywords", [])
     title_lower = job_title.lower()
-    
-    # Strip common contract/freelance qualifiers so they don't block matching
-    for noise in ["(contract)", "(freelance)", "(part-time)", "(hourly)", "- contract", "- freelance"]:
-        title_lower = title_lower.replace(noise, "")
     
     return any(kw.lower() in title_lower for kw in keywords)
 
@@ -112,11 +167,45 @@ async def process_job(page: Page, job_url: str, profile: dict):
         job_title = ""
     
     if job_title and not is_job_relevant(job_title, profile):
-        print(f"  Skipping irrelevant job: '{job_title}'")
+        is_c, r = is_contract_job(job_title)
+        if is_c:
+            print(f"  Skipping contract job: {r} in title '{job_title}'")
+        else:
+            print(f"  Skipping irrelevant job: '{job_title}'")
         return False
     
     if job_title:
         print(f"  Job title: '{job_title}' — relevant, proceeding.")
+
+    # --- Contract check: inspect page employment details & insights ---
+    if profile.get("job_preferences", {}).get("exclude_contract", True):
+        try:
+            job_details_snippet = await page.evaluate("""() => {
+                const selectors = [
+                    '.job-details-jobs-unified-top-card__job-insight',
+                    '.jobs-unified-top-card__job-insight',
+                    'li[class*="job-insight"]',
+                    'span[class*="job-insight"]',
+                    '.job-details-jobs-unified-top-card__primary-description',
+                    '.job-details-jobs-unified-top-card',
+                    '.jobs-unified-top-card'
+                ];
+                const matched = [];
+                for (const s of selectors) {
+                    const elements = Array.from(document.querySelectorAll(s));
+                    for (const el of elements) {
+                        if (el && el.innerText) matched.push(el.innerText);
+                    }
+                }
+                return matched.join(' ');
+            }""")
+        except Exception:
+            job_details_snippet = ""
+
+        is_c_insight, c_reason = is_contract_job(job_details_snippet)
+        if is_c_insight:
+            print(f"  Skipping job: {c_reason} in employment type details ({job_url})")
+            return False
 
     # --- Location check: reject jobs in excluded locations ---
     try:
@@ -260,7 +349,7 @@ async def main():
         print("Error: Keywords and locations must be defined in profile.")
         return
 
-    search_url = build_search_url(keywords, locations)
+    search_url = build_search_url(keywords, locations, profile)
     print(f"Search URL: {search_url}")
     
     async with async_playwright() as p:
@@ -311,6 +400,13 @@ async def main():
                             allowed, reason = is_location_allowed(card_text, profile)
                             if not allowed:
                                 continue
+                            
+                            # Filter contract cards
+                            if profile.get("job_preferences", {}).get("exclude_contract", True):
+                                is_c, c_reason = is_contract_job(card_text)
+                                if is_c:
+                                    continue
+
                             link_el = card.locator("a[href*='/jobs/view/']").first
                             if await link_el.count() > 0:
                                 href = await link_el.get_attribute("href")
