@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp(linkedin/*)"
+    ],
+    "ask": [
+      "mcp(linkedin/send_dm)",
+      "mcp(linkedin/reply_in_dm)"
+    ]
+  }
+}

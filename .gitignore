@@ -21,9 +21,12 @@ env/
 # macOS
 .DS_Store
 
-# Logs
+# Logs and runtime data
 *.log
 applied_jobs.txt
+sent_invites.json
+naukri_refresh_log.json
+scratch/
 
 # Personal profiles (contain PII — never commit personal ones)
 profiles/*.yaml
