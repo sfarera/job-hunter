@@ -1,7 +1,7 @@
 """
-Naukri Authentication Assistant.
-Launches a headed browser for the user to manually log in to Naukri.com,
-then saves the authenticated browser session state for automated headless runs.
+Naukri Authentication Assistant - Real Google Chrome Edition.
+Launches your real installed Google Chrome browser on macOS so Google Sign-In and Naukri
+authentication work seamlessly without security blocks.
 """
 
 import os
@@ -24,17 +24,18 @@ async def manual_naukri_login():
     AUTH_DIR.mkdir(parents=True, exist_ok=True)
     
     print("=" * 60)
-    print("Naukri.com Authentication Assistant")
+    print("Naukri Authentication Assistant (Real Google Chrome)")
     print("=" * 60)
-    print("Launching headed browser for manual login...")
-    print("1. Log in to your Naukri account (Email/Password or OTP).")
-    print("2. Once logged in and on your profile or homepage,")
-    print("   the session will be automatically detected and saved.")
+    print("Launching your REAL Google Chrome browser...")
+    print("1. Log in to your Naukri account (Google Sign-In, Email, or OTP).")
+    print("2. Once you reach your profile or homepage, the session")
+    print("   will automatically be detected and saved to .auth/naukri_state.json")
     print("=" * 60)
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=False,
+            channel="chrome",  # Uses your real installed Google Chrome!
             args=[
                 "--no-sandbox",
                 "--disable-blink-features=AutomationControlled",
@@ -52,40 +53,36 @@ async def manual_naukri_login():
         await page.goto("https://www.naukri.com/nlogin/login", wait_until="domcontentloaded")
 
         logged_in = False
-        print("[*] Waiting for login completion (up to 5 minutes)...")
+        print("[*] Waiting for login completion (polling every 2s, up to 5 minutes)...")
 
-        for _ in range(150): # up to 5 minutes
+        for _ in range(150):
             await asyncio.sleep(2)
             try:
                 current_url = page.url
-                # Naukri redirects to homepage, profile, or mnjuser upon login
+                cookies = await context.cookies()
+                cookie_names = [c["name"] for c in cookies]
+
+                # Check URL or auth cookies
                 if any(x in current_url for x in ["mnjuser/homepage", "mnjuser/profile", "naukri.com/mnjuser"]):
                     logged_in = True
                     print(f"\n[+] Login detected on URL: {current_url}")
-                    print(f"[*] Saving authenticated session state to: {STATE_FILE}")
-                    await context.storage_state(path=str(STATE_FILE))
-                    print("[+] Session state saved successfully!")
-                    print("[*] Closing browser in 3 seconds...")
-                    await asyncio.sleep(3)
                     break
 
-                # Also inspect cookies for auth tokens
-                cookies = await context.cookies()
-                cookie_names = [c["name"] for c in cookies]
                 if any(token in cookie_names for token in ["nauk_at", "_nk", "NAUKRI_USER"]):
                     logged_in = True
                     print(f"\n[+] Auth token detected in cookies: {[c for c in cookie_names if c in ['nauk_at', '_nk', 'NAUKRI_USER']]}")
-                    print(f"[*] Saving authenticated session state to: {STATE_FILE}")
-                    await context.storage_state(path=str(STATE_FILE))
-                    print("[+] Session state saved successfully!")
-                    print("[*] Closing browser in 3 seconds...")
-                    await asyncio.sleep(3)
                     break
             except Exception:
-                # User might have closed window
+                # Browser or window closed by user
                 break
 
-        if not logged_in:
+        if logged_in:
+            print("[*] Saving authenticated session state...")
+            await context.storage_state(path=str(STATE_FILE))
+            print("[+] Session state saved successfully to .auth/naukri_state.json!")
+            print("[*] Closing browser in 3 seconds...")
+            await asyncio.sleep(3)
+        else:
             print("\n[!] Attempting fallback session save before exit...")
             try:
                 await context.storage_state(path=str(STATE_FILE))
@@ -101,7 +98,6 @@ async def manual_naukri_login():
         print("=" * 60)
         print("SUCCESS: Naukri authentication setup completed!")
         print(f"State file: {STATE_FILE}")
-        print("You can now run: python naukri_refresh.py")
         print("=" * 60)
     else:
         print("[!] Warning: Could not verify saved session file.")

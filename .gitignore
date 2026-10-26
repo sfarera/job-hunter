@@ -26,6 +26,8 @@ env/
 applied_jobs.txt
 sent_invites.json
 naukri_refresh_log.json
+naukri_applied_jobs.csv
+naukri_external_jobs.csv
 scratch/
 
 # Personal profiles (contain PII — never commit personal ones)
