@@ -46,9 +46,18 @@ Rules:
 2. Fill all visible empty required fields and any field with a validation error.
 3. Do not refill fields that already have a correct value.
 4. Numeric fields must contain digits only: no commas, currency symbols, units, or words.
-5. Years of experience must be a number only.
+5. Years of experience must be a number only:
+   - For Java, Spring Boot, Microservices, REST APIs, SQL, Hibernate: enter 8 (or match skill_experience_years).
+   - For AI tools, Generative AI, ChatGPT, Copilot, Cursor, LLMs: enter 1.
+   - For any other technology outside the core stack (e.g., Python, Go, React, Angular, AWS, Kafka, Node, etc.): enter 2.
+   - For total / overall software engineering experience: enter 8.
 6. For dropdowns, use one of the provided option labels exactly.
-7. For radio/checkbox questions, choose the option that best matches profile.standard_answers.
+7. For radio/checkbox questions:
+   - "Comfortable with remote work / WFH": ALWAYS select "Yes".
+   - "Willing to relocate / relocation": ALWAYS select "Yes".
+   - "Legally authorized to work": ALWAYS select "Yes".
+   - "Require visa sponsorship": ALWAYS select "No".
+   - Otherwise choose the option that best matches profile.standard_answers.
 8. For file upload fields, use an upload action with profile.resume_path.
 9. If a field has an error, fix that field before clicking the next button.
 10. Always finish with one click action using one of the visible enabled buttons, unless the form is already submitted.
@@ -372,16 +381,48 @@ def try_fast_path_actions(context: dict[str, Any], profile: dict[str, Any]) -> O
             actions.append({"action": "upload", "id": field_id, "path": resume_path})
             continue
 
+        # Remote comfort
+        if any(term in label for term in ["remote", "work from home", "wfh"]):
+            if f_tag == "select" and f.get("options"):
+                opt = next((o for o in f["options"] if o.strip().lower() in ["yes", "true", "comfortable"]), f["options"][0])
+                actions.append({"action": "select", "id": field_id, "value": opt})
+            elif f_type in ["text", ""]:
+                actions.append({"action": "fill", "id": field_id, "value": "Yes"})
+            continue
+
+        # Relocation
+        if any(term in label for term in ["relocate", "relocation"]):
+            if f_tag == "select" and f.get("options"):
+                opt = next((o for o in f["options"] if o.strip().lower() in ["yes", "true", "willing"]), f["options"][0])
+                actions.append({"action": "select", "id": field_id, "value": opt})
+            elif f_type in ["text", ""]:
+                actions.append({"action": "fill", "id": field_id, "value": "Yes"})
+            continue
+
         # Experience questions (e.g. "How many years of work experience do you have with Java?")
-        if any(term in label for term in ["years", "experience"]):
+        if any(term in label for term in ["years", "experience", "how many"]):
+            # Check if total / overall software engineering experience
+            if any(term in label for term in ["total", "overall", "industry", "software engineering", "software development"]) and not any(k in label for k in ["ai", "tool", "copilot", "chatgpt"]):
+                actions.append({"action": "fill", "id": field_id, "value": "8"})
+                continue
+
+            # Check if AI tools
+            if any(term in label for term in ["ai", "artificial intelligence", "genai", "generative ai", "copilot", "cursor", "chatgpt", "llm"]):
+                actions.append({"action": "fill", "id": field_id, "value": "1"})
+                continue
+
+            # Check matching skills from profile
             matched_years = None
             for skill, yrs in skill_exp.items():
-                if skill.lower() in label:
+                if re.search(r'\b' + re.escape(skill.lower()) + r'\b', label):
                     matched_years = str(yrs)
                     break
-            if not matched_years:
-                matched_years = str(profile.get("professional_info", {}).get("years_of_experience", 8))
-            actions.append({"action": "fill", "id": field_id, "value": matched_years})
+
+            if matched_years:
+                actions.append({"action": "fill", "id": field_id, "value": matched_years})
+            else:
+                # Any other technology outside core tech stack: default to 2 years!
+                actions.append({"action": "fill", "id": field_id, "value": "2"})
             continue
 
         # Location / City
@@ -392,12 +433,15 @@ def try_fast_path_actions(context: dict[str, Any], profile: dict[str, Any]) -> O
 
         # Notice period
         if "notice" in label or "period" in label:
-            np = str(standard_answers.get("notice_period", "3 months"))
             if f_tag == "select" and f.get("options"):
-                opt = next((o for o in f["options"] if "3" in o or "month" in o.lower()), f["options"][0])
+                opt = next((o for o in f["options"] if "2" in o or "60" in o or "month" in o.lower()), f["options"][0])
                 actions.append({"action": "select", "id": field_id, "value": opt})
             else:
-                actions.append({"action": "fill", "id": field_id, "value": np})
+                if "day" in label:
+                    np_val = "60"
+                else:
+                    np_val = "2"
+                actions.append({"action": "fill", "id": field_id, "value": np_val})
             continue
 
         # Salary
@@ -423,8 +467,10 @@ def try_fast_path_actions(context: dict[str, Any], profile: dict[str, Any]) -> O
             target_choice = "No" if not standard_answers.get("require_sponsorship", False) else "Yes"
         elif "authorized" in group_label or "legally" in group_label:
             target_choice = "Yes" if standard_answers.get("legally_authorized", True) else "No"
-        elif "relocate" in group_label:
-            target_choice = "Yes" if standard_answers.get("willing_to_relocate", True) else "No"
+        elif "relocate" in group_label or "relocation" in group_label:
+            target_choice = "Yes"
+        elif any(t in group_label for t in ["remote", "work from home", "wfh"]):
+            target_choice = "Yes"
         elif "commute" in group_label:
             target_choice = "Yes" if standard_answers.get("willing_to_commute", True) else "No"
         elif "background" in group_label:

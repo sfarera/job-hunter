@@ -47,7 +47,11 @@ def build_search_url(keywords, locations, profile=None):
         query = str(keywords)
 
     keyword_str = urllib.parse.quote(query)
-    location_str = urllib.parse.quote(locations[0]) if locations else "Remote"
+    if isinstance(locations, list):
+        loc = locations[0] if locations else "Remote"
+    else:
+        loc = str(locations) if locations else "Remote"
+    location_str = urllib.parse.quote(loc)
     
     # f_AL=true  = Easy Apply only
     # f_I=96,4,556,6 = IT Services & Consulting, Software Development, Technology & Information, Computer Hardware
@@ -62,7 +66,6 @@ def build_search_url(keywords, locations, profile=None):
         f"keywords={keyword_str}"
         f"&location={location_str}"
         f"&f_AL=true"
-        f"&f_I=96%2C4%2C556%2C6"
         f"&f_WT=2%2C3%2C4"
         f"{job_type_param}"
     )
@@ -349,95 +352,93 @@ async def main():
         print("Error: Keywords and locations must be defined in profile.")
         return
 
-    search_url = build_search_url(keywords, locations, profile)
-    print(f"Search URL: {search_url}")
-    
+    max_apps = int(os.getenv("MAX_APPLICATIONS", "15"))
+    target_links = max(max_apps * 5, max_apps)
+    job_links = []
+
     async with async_playwright() as p:
         browser = await get_browser(p, headless=False)
         # Attempt to load persistent context. Ensure user has run auth.py first!
         context = await get_context(browser, persist=True)
         page = await context.new_page()
-        
-        print("Navigating to search results...")
-        await page.goto(search_url, wait_until="domcontentloaded")
-        await asyncio.sleep(2)
-        current_url = page.url
-        if not await has_valid_linkedin_session(page) or any(auth_kw in current_url for auth_kw in ["/login", "/uas/login", "checkpoint", "authwall"]):
-            print("\n" + "=" * 60)
-            print("[ERROR] LinkedIn session is expired or not authenticated!")
-            print(f"Current page URL: {current_url}")
-            print("LinkedIn requires an active session to search and Easy Apply.")
-            print("Please run:")
-            print("    python auth.py")
-            print("to log in and save your session, then re-run 'python main.py'.")
-            print("=" * 60 + "\n")
-            await browser.close()
-            return
-        
-        # Scrape job cards (robust method)
-        job_links = []
-        max_apps = int(os.getenv("MAX_APPLICATIONS", "15"))
-        try:
-            # Wait for the job list to appear with multiple fallback selectors
-            job_list_selector = ".jobs-search-results__list, .jobs-search-results-list, .scaffold-layout__list, .scaffold-layout__list-container"
+
+        for loc in locations:
+            if len(job_links) >= target_links:
+                break
+            search_url = build_search_url(keywords, loc, profile)
+            print(f"\nNavigating to search results for location [{loc}]...")
+            await page.goto(search_url, wait_until="domcontentloaded")
+            await asyncio.sleep(2)
+            current_url = page.url
+            if not await has_valid_linkedin_session(page) or any(auth_kw in current_url for auth_kw in ["/login", "/uas/login", "checkpoint", "authwall"]):
+                print("\n" + "=" * 60)
+                print("[ERROR] LinkedIn session is expired or not authenticated!")
+                print(f"Current page URL: {current_url}")
+                print("LinkedIn requires an active session to search and Easy Apply.")
+                print("Please run:")
+                print("    python auth.py")
+                print("to log in and save your session, then re-run 'python main.py'.")
+                print("=" * 60 + "\n")
+                await browser.close()
+                return
+
             try:
-                await page.wait_for_selector(job_list_selector, timeout=15000)
-            except Exception:
-                # If container selector times out, check if any job links are already loaded
-                if await page.locator("a[href*='/jobs/view/']").count() == 0:
-                    raise
-            
-            # Scroll the job list panel to lazy-load more cards
-            target_links = max(max_apps * 5, max_apps)
-            print(f"Collecting up to {target_links} candidate job links...")
-            for scroll_pass in range(6): # Fast scroll passes
-                # High-speed DOM evaluation in a single browser call (takes ~5ms)
-                cards_data = await page.evaluate("""() => {
-                    const cards = Array.from(document.querySelectorAll(
-                        'li[data-occludable-job-id], .jobs-search-results__list-item, div.job-card-container, div[data-view-name="job-card"]'
-                    ));
-                    return cards.map(c => {
-                        const link = c.querySelector('a[href*="/jobs/view/"]');
-                        return {
-                            text: c.innerText || '',
-                            href: link ? link.getAttribute('href') : ''
-                        };
-                    }).filter(item => item.href);
-                }""")
-
-                for item in cards_data:
-                    card_text = item.get("text", "")
-                    href = item.get("href", "")
-
-                    allowed, _ = is_location_allowed(card_text, profile)
-                    if not allowed:
+                # Wait for the job list to appear with multiple fallback selectors
+                job_list_selector = ".jobs-search-results__list, .jobs-search-results-list, .scaffold-layout__list, .scaffold-layout__list-container"
+                try:
+                    await page.wait_for_selector(job_list_selector, timeout=10000)
+                except Exception:
+                    if await page.locator("a[href*='/jobs/view/']").count() == 0:
+                        print(f"  No jobs found for location [{loc}].")
                         continue
 
-                    if profile.get("job_preferences", {}).get("exclude_contract", True):
-                        is_c, _ = is_contract_job(card_text)
-                        if is_c:
+                # Scroll the job list panel to lazy-load more cards
+                print(f"  Collecting candidate job links for [{loc}]...")
+                for scroll_pass in range(6):
+                    cards_data = await page.evaluate("""() => {
+                        const cards = Array.from(document.querySelectorAll(
+                            'li[data-occludable-job-id], .jobs-search-results__list-item, div.job-card-container, div[data-view-name="job-card"]'
+                        ));
+                        return cards.map(c => {
+                            const link = c.querySelector('a[href*="/jobs/view/"]');
+                            return {
+                                text: c.innerText || '',
+                                href: link ? link.getAttribute('href') : ''
+                            };
+                        }).filter(item => item.href);
+                    }""")
+
+                    for item in cards_data:
+                        card_text = item.get("text", "")
+                        href = item.get("href", "")
+
+                        allowed, _ = is_location_allowed(card_text, profile)
+                        if not allowed:
                             continue
 
-                    clean_url = "https://www.linkedin.com" + href.split("?")[0] if href.startswith("/") else href.split("?")[0]
-                    if clean_url not in job_links:
-                        job_links.append(clean_url)
+                        if profile.get("job_preferences", {}).get("exclude_contract", True):
+                            is_c, _ = is_contract_job(card_text)
+                            if is_c:
+                                continue
 
-                if len(job_links) >= target_links:
-                    break
+                        clean_url = "https://www.linkedin.com" + href.split("?")[0] if href.startswith("/") else href.split("?")[0]
+                        if clean_url not in job_links:
+                            job_links.append(clean_url)
 
-                # Scroll the job list panel down to load more cards
-                await page.evaluate("""
-                    const list = document.querySelector('.jobs-search-results__list, .jobs-search-results-list, .scaffold-layout__list, .scaffold-layout__list-container');
-                    if (list) list.scrollBy(0, 800);
-                """)
-                await asyncio.sleep(0.4) # Fast scroll wait
-            
-            print(f"Found {len(job_links)} unique job links after scrolling.")
-            # We no longer hardcode a limit here, we check max_applications below
-        except Exception as e:
-            print(f"Error scraping job list: {e}")
-            
-        print(f"Found {len(job_links)} jobs to process.")
+                    if len(job_links) >= target_links:
+                        break
+
+                    await page.evaluate("""
+                        const list = document.querySelector('.jobs-search-results__list, .jobs-search-results-list, .scaffold-layout__list, .scaffold-layout__list-container');
+                        if (list) list.scrollBy(0, 800);
+                    """)
+                    await asyncio.sleep(0.4)
+
+                print(f"  Total collected so far: {len(job_links)} unique job links.")
+            except Exception as e:
+                print(f"Error scraping job list for {loc}: {e}")
+
+        print(f"\nFound {len(job_links)} candidate jobs across locations.")
         
         applied_jobs_set = load_applied_jobs()
         success_count = 0

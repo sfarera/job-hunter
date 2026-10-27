@@ -7,7 +7,7 @@ for 8+ Yrs Senior Java / Spring Boot roles in Pune/Remote.
 Features:
 - Real Chrome binary execution to bypass Akamai WAF
 - Intelligent questionnaire solver for chatbot drawer:
-    * Notice Period: 1 month / 30 days
+    * Notice Period: 2 months / 60 days
     * Total Experience: 8 years
     * Relevant Java Experience: 8 years
     * Current CTC: 18.4 LPA
@@ -46,8 +46,8 @@ EXTERNAL_LEDGER = Path("naukri_external_jobs.csv")
 
 # Candidate profile parameters
 CANDIDATE_PROFILE = {
-    "notice_period": "1 month",
-    "notice_period_days": "30",
+    "notice_period": "2 month",
+    "notice_period_days": "60",
     "total_experience": "8",
     "relevant_experience": "8",
     "current_ctc_lpa": "18.4",
@@ -146,10 +146,10 @@ async def solve_chatbot_drawer(page: Page, max_rounds: int = 5) -> bool:
 
         # 1. Notice Period Question
         if any(w in current_question for w in ["notice", "period", "joining", "how soon", "available"]):
-            opt = page.locator("._chatBotContainer label:has-text('1 month'), ._chatBotContainer span:has-text('1 month'), ._chatBotContainer li:has-text('1 month'), ._chatBotContainer label:has-text('30 days')").first
+            opt = page.locator("._chatBotContainer label:has-text('1 month'), ._chatBotContainer span:has-text('2 month'), ._chatBotContainer li:has-text('1 month'), ._chatBotContainer label:has-text('60 days')").first
             if await opt.count() > 0 and await opt.is_visible():
                 await opt.click()
-                logger.info("  -> Selected: '1 month'")
+                logger.info("  -> Selected: '2 month'")
                 answered = True
             else:
                 input_box = page.locator("._chatBotContainer input[type='text'], ._chatBotContainer textarea").first
@@ -158,12 +158,19 @@ async def solve_chatbot_drawer(page: Page, max_rounds: int = 5) -> bool:
                     logger.info(f"  -> Entered notice period: {CANDIDATE_PROFILE['notice_period']}")
                     answered = True
 
-        # 2. Experience Question (Total or Relevant)
-        elif any(w in current_question for w in ["experience", "years", "java", "spring", "relevant"]):
+        # 2. Experience Question (Total, AI, Core Stack, or Other Tech)
+        elif any(w in current_question for w in ["experience", "years", "relevant"]):
             input_box = page.locator("._chatBotContainer input[type='text'], ._chatBotContainer textarea").first
             if await input_box.count() > 0 and await input_box.is_visible():
-                await input_box.fill(CANDIDATE_PROFILE["total_experience"])
-                logger.info(f"  -> Entered experience: {CANDIDATE_PROFILE['total_experience']} years")
+                if any(w in current_question for w in ["ai", "copilot", "chatgpt", "genai", "generative ai", "llm"]):
+                    exp_val = "1"
+                elif any(w in current_question for w in ["java", "spring", "microservice", "sql", "hibernate", "total", "overall"]):
+                    exp_val = CANDIDATE_PROFILE["total_experience"]
+                else:
+                    # Non-core tech stack
+                    exp_val = "2"
+                await input_box.fill(exp_val)
+                logger.info(f"  -> Entered experience: {exp_val} years")
                 answered = True
             else:
                 # Look for radio option containing '8' or '5-8'
@@ -191,8 +198,8 @@ async def solve_chatbot_drawer(page: Page, max_rounds: int = 5) -> bool:
                 logger.info(f"  -> Entered Expected CTC: {val}")
                 answered = True
 
-        # 5. Relocation / Location / Yes-No questions
-        elif any(w in current_question for w in ["relocate", "relocation", "pune", "willing", "ready"]):
+        # 5. Relocation / Remote / Location / Yes-No questions
+        elif any(w in current_question for w in ["relocate", "relocation", "pune", "willing", "ready", "remote", "wfh", "work from home"]):
             yes_opt = page.locator("._chatBotContainer label:has-text('Yes'), ._chatBotContainer span:has-text('Yes')").first
             if await yes_opt.count() > 0 and await yes_opt.is_visible():
                 await yes_opt.click()
@@ -323,69 +330,88 @@ async def run_auto_apply(
         await context.add_init_script(STEALTH_JS)
         page = await context.new_page()
 
-        search_url = f"https://www.naukri.com/{query_slug}?experience={experience}&jobAge={job_age}"
-        logger.info(f"Navigating to search page: {search_url}")
-        await page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
-        await asyncio.sleep(4.0)
-
-        # Scrape job cards from search results
-        raw_jobs = await page.eval_on_selector_all(
-            ".srp-jobtuple-wrapper, div[data-job-id], article.jobTuple",
-            """elements => elements.map(e => {
-                const titleEl = e.querySelector('a.title, [class*="title"] a, a[class*="title"]');
-                const compEl = e.querySelector('a.comp-name, [class*="comp-name"], a[class*="subTitle"]');
-                const expEl = e.querySelector('.exp-wrap, [class*="exp"]');
-                const locEl = e.querySelector('.loc-wrap, [class*="loc"]');
-                const jobId = e.getAttribute('data-job-id') || (titleEl ? (titleEl.href.match(/(\\d{10,})/i) || ['',''])[1] : '');
-                return {
-                    id: jobId,
-                    title: titleEl ? titleEl.innerText.trim() : '',
-                    url: titleEl ? titleEl.href : '',
-                    company: compEl ? compEl.innerText.trim() : '',
-                    experience: expEl ? expEl.innerText.trim() : '',
-                    location: locEl ? locEl.innerText.trim() : ''
-                };
-            }).filter(j => j.title && j.url)"""
-        )
-
-        logger.info(f"Discovered {len(raw_jobs)} job listings on page.")
-        
-        # Filter out already applied
-        eligible_jobs = [j for j in raw_jobs if j["id"] not in applied_ids and j["url"] not in applied_ids]
-        logger.info(f"{len(eligible_jobs)} new eligible jobs to process.")
-
         applied_count = 0
         external_count = 0
+        page_num = 1
+        max_search_pages = 6
 
         # Create separate tab for job detail pages to keep search page alive
         job_page = await context.new_page()
 
-        for idx, job in enumerate(eligible_jobs):
-            if applied_count >= limit:
-                logger.info(f"Target limit of {limit} applications reached for this session.")
+        while applied_count < limit and page_num <= max_search_pages:
+            search_suffix = "" if page_num == 1 else f"-{page_num}"
+            search_url = f"https://www.naukri.com/{query_slug}{search_suffix}?experience={experience}&jobAge={job_age}"
+            logger.info(f"\n==================================================")
+            logger.info(f"Navigating to search page {page_num}: {search_url}")
+            logger.info(f"Progress so far: {applied_count}/{limit} applied")
+            logger.info(f"==================================================")
+            await page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(4.0)
+
+            # Scrape job cards from search results
+            raw_jobs = await page.eval_on_selector_all(
+                ".srp-jobtuple-wrapper, div[data-job-id], article.jobTuple",
+                """elements => elements.map(e => {
+                    const titleEl = e.querySelector('a.title, [class*="title"] a, a[class*="title"]');
+                    const compEl = e.querySelector('a.comp-name, [class*="comp-name"], a[class*="subTitle"]');
+                    const expEl = e.querySelector('.exp-wrap, [class*="exp"]');
+                    const locEl = e.querySelector('.loc-wrap, [class*="loc"]');
+                    const jobId = e.getAttribute('data-job-id') || (titleEl ? (titleEl.href.match(/(\\d{10,})/i) || ['',''])[1] : '');
+                    return {
+                        id: jobId,
+                        title: titleEl ? titleEl.innerText.trim() : '',
+                        url: titleEl ? titleEl.href : '',
+                        company: compEl ? compEl.innerText.trim() : '',
+                        experience: expEl ? expEl.innerText.trim() : '',
+                        location: locEl ? locEl.innerText.trim() : ''
+                    };
+                }).filter(j => j.title && j.url)"""
+            )
+
+            logger.info(f"Discovered {len(raw_jobs)} job listings on page {page_num}.")
+            
+            # Filter out already applied
+            eligible_jobs = [j for j in raw_jobs if j["id"] not in applied_ids and j["url"] not in applied_ids]
+            logger.info(f"{len(eligible_jobs)} new eligible jobs to process on page {page_num}.")
+
+            if not eligible_jobs and not raw_jobs:
+                logger.info(f"No more jobs found. Ending search.")
                 break
 
-            logger.info(f"\n[{idx + 1}/{len(eligible_jobs)}] Processing: {job['title']} @ {job['company']}")
-            status = await apply_to_job(job_page, job)
+            for idx, job in enumerate(eligible_jobs):
+                if applied_count >= limit:
+                    logger.info(f"Target limit of {limit} applications reached for this session.")
+                    break
 
-            if status == "Applied":
-                applied_count += 1
-                logger.info(f"🎯 Total Applied This Session: {applied_count}/{limit}")
-                # Safe human cooldown between applications
-                cooldown = random.randint(18, 30)
-                logger.info(f"Sleeping {cooldown}s (Safe Human Pacing)...")
-                await asyncio.sleep(cooldown)
+                logger.info(f"\n[{idx + 1}/{len(eligible_jobs)} on p.{page_num}] Processing: {job['title']} @ {job['company']}")
+                status = await apply_to_job(job_page, job)
 
-            elif status == "External":
-                external_count += 1
-                await asyncio.sleep(2.0)
+                if status == "Applied":
+                    applied_count += 1
+                    applied_ids.add(job["id"])
+                    applied_ids.add(job["url"])
+                    logger.info(f"🎯 Total Applied This Session: {applied_count}/{limit}")
+                    # Safe human cooldown between applications
+                    cooldown = random.randint(18, 30)
+                    logger.info(f"Sleeping {cooldown}s (Safe Human Pacing)...")
+                    await asyncio.sleep(cooldown)
 
-            elif status == "AlreadyApplied":
-                record_applied_job(job, "AlreadyApplied")
-                await asyncio.sleep(1.5)
+                elif status == "External":
+                    external_count += 1
+                    applied_ids.add(job["id"])
+                    applied_ids.add(job["url"])
+                    await asyncio.sleep(2.0)
 
-            else:
-                await asyncio.sleep(2.0)
+                elif status == "AlreadyApplied":
+                    record_applied_job(job, "AlreadyApplied")
+                    applied_ids.add(job["id"])
+                    applied_ids.add(job["url"])
+                    await asyncio.sleep(1.5)
+
+                else:
+                    await asyncio.sleep(2.0)
+
+            page_num += 1
 
         logger.info("\n" + "=" * 50)
         logger.info(f"SESSION SUMMARY:")
